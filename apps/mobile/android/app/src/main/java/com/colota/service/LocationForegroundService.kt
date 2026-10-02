@@ -233,7 +233,7 @@ class LocationForegroundService : Service() {
             },
             onStationaryChanged = ::handleStationaryChanged
         )
-        conditionMonitor = ConditionMonitor(this, profileManager)
+        conditionMonitor = ConditionMonitor(this, networkManager, profileManager)
 
         notificationHelper = NotificationHelper(this, notificationManager)
         notificationHelper.createChannel()

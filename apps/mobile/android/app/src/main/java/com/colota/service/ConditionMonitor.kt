@@ -15,20 +15,25 @@ import android.os.Handler
 import android.os.Looper
 import androidx.car.app.connection.CarConnection
 import androidx.lifecycle.Observer
+import com.Colota.sync.NetworkManager
 import com.Colota.util.AppLogger
 
 /**
- * Monitors device conditions (charging state, Android Auto connection)
+ * Monitors device conditions (charging state, Android Auto connection, Wi-Fi)
  * and notifies ProfileManager when conditions change.
  *
  * Android Auto is detected via the [CarConnection] API, which reliably
- * reports projection and native car connections.
+ * reports projection and native car connections. Wi-Fi transport changes come
+ * from the service's [NetworkManager], which tracks connected Wi-Fi networks
+ * with a plain (unflagged) callback; a named-network profile reads the name
+ * through a one-shot location-flagged probe when that transport changes.
  *
  * All observers are registered programmatically so they only run while
  * the foreground service is active.
  */
 class ConditionMonitor(
     private val context: Context,
+    private val networkManager: NetworkManager,
     private val profileManager: ProfileManager
 ) {
     companion object {
@@ -39,6 +44,8 @@ class ConditionMonitor(
     private var carConnection: CarConnection? = null
     private var carConnectionObserver: Observer<Int>? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    // Main thread only: invalidates in-flight SSID probes when a newer network change arrives.
+    private var wifiPushGeneration = 0
 
     fun start() {
         // Unregister first to prevent duplicate observers on repeated start() calls
@@ -56,12 +63,17 @@ class ConditionMonitor(
             startCarConnectionMonitor()
         }
 
+        if (ProfileConstants.CONDITION_WIFI_ANY in needed || ProfileConstants.CONDITION_WIFI_SSID in needed) {
+            startWifiMonitor()
+        }
+
         AppLogger.d(TAG, "Condition monitors started for: ${needed.ifEmpty { setOf("none") }}")
     }
 
     fun stop() {
         chargingReceiver = unregisterSafely(chargingReceiver)
         stopCarConnectionMonitor()
+        networkManager.setWifiStateListener(null)
 
         AppLogger.d(TAG, "Condition monitors stopped")
     }
@@ -130,6 +142,40 @@ class ConditionMonitor(
 
         carConnectionObserver = null
         carConnection = null
+    }
+
+    /**
+     * Forwards Wi-Fi state changes to the profile manager. The listener is registered before the
+     * first read, so a change landing in that window still arrives instead of being missed.
+     */
+    private fun startWifiMonitor() {
+        networkManager.setWifiStateListener {
+            mainHandler.post { pushWifiState() }
+        }
+        pushWifiState()
+    }
+
+    /**
+     * The transport-only listener above carries no location flag and can stay registered; the
+     * network name is read one-shot only when a named-network profile needs it, so the indicator
+     * lights for that moment instead of the whole session. The probe targets the Wi-Fi transport,
+     * so the name is readable under a VPN too. The generation drops probe results that a newer
+     * network change has already superseded.
+     */
+    private fun pushWifiState() {
+        val generation = ++wifiPushGeneration
+        val connected = networkManager.isWifiConnected()
+        if (connected && ProfileConstants.CONDITION_WIFI_SSID in profileManager.getNeededConditionTypes()) {
+            networkManager.readSsidOnce { ssid ->
+                mainHandler.post {
+                    if (generation == wifiPushGeneration) {
+                        profileManager.onWifiStateChanged(networkManager.isWifiConnected(), ssid)
+                    }
+                }
+            }
+        } else {
+            profileManager.onWifiStateChanged(connected, "")
+        }
     }
 
     private fun readCurrentChargingState(): Boolean {

@@ -8,6 +8,8 @@ package com.Colota.data
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import com.Colota.util.AppLogger
+import com.facebook.react.bridge.Arguments
+import com.facebook.react.bridge.WritableMap
 import io.mockk.*
 import org.junit.After
 import org.junit.Assert.*
@@ -61,7 +63,7 @@ class ProfileHelperTest {
         val columns = listOf(
             "id", "name", "interval_ms", "min_update_distance",
             "sync_interval_seconds", "priority", "condition_type",
-            "speed_threshold", "deactivation_delay_seconds", "activation_delay_seconds",
+            "speed_threshold", "wifi_ssid", "deactivation_delay_seconds", "activation_delay_seconds",
             "enabled", "created_at"
         )
 
@@ -141,6 +143,7 @@ class ProfileHelperTest {
         assertEquals(10000L, profiles[0].intervalMs)
         assertEquals("charging", profiles[0].conditionType)
         assertNull(profiles[0].speedThreshold)
+        assertNull(profiles[0].wifiSsid)
     }
 
     @Test
@@ -228,6 +231,57 @@ class ProfileHelperTest {
         assertEquals(1, profiles.size)
         assertEquals(13.89f, profiles[0].speedThreshold!!, 0.01f)
         assertEquals("speed_above", profiles[0].conditionType)
+    }
+
+    @Test
+    fun `getEnabledProfiles reads the wifi SSID`() {
+        val cursor = mockCursorWithProfiles(listOf(
+            mapOf(
+                "id" to 1, "name" to "Home", "interval_ms" to 60000L,
+                "min_update_distance" to 10f, "sync_interval_seconds" to 300,
+                "priority" to 15, "condition_type" to "wifi_ssid",
+                "speed_threshold" to null, "wifi_ssid" to "HomeNet",
+                "deactivation_delay_seconds" to 60
+            )
+        ))
+
+        every { mockDb.query(any(), any(), eq("enabled = 1"), any(), any(), any(), any()) } returns cursor
+
+        val helper = ProfileHelper(mockk(relaxed = true))
+        val profiles = helper.getEnabledProfiles()
+
+        assertEquals(1, profiles.size)
+        assertEquals("wifi_ssid", profiles[0].conditionType)
+        assertEquals("HomeNet", profiles[0].wifiSsid)
+    }
+
+    @Test
+    fun `getProfilesAsArray reads the wifi SSID`() {
+        // The reader behind the profile list; a broken column read here only shows up on device.
+        val cursor = mockCursorWithProfiles(listOf(
+            mapOf(
+                "id" to 1, "name" to "Home", "interval_ms" to 60000L,
+                "min_update_distance" to 10f, "sync_interval_seconds" to 300,
+                "priority" to 15, "condition_type" to "wifi_ssid",
+                "speed_threshold" to null, "wifi_ssid" to "HomeNet",
+                "deactivation_delay_seconds" to 60, "activation_delay_seconds" to 0,
+                "enabled" to 1, "created_at" to 0
+            )
+        ))
+        every { mockDb.query(any(), any(), any(), any(), any(), any(), any()) } returns cursor
+
+        mockkStatic(Arguments::class)
+        try {
+            val map = mockk<WritableMap>(relaxed = true)
+            every { Arguments.createArray() } returns mockk(relaxed = true)
+            every { Arguments.createMap() } returns map
+
+            ProfileHelper(mockk(relaxed = true)).getProfilesAsArray()
+
+            verify { map.putString("wifiSsid", "HomeNet") }
+        } finally {
+            unmockkStatic(Arguments::class)
+        }
     }
 
     @Test

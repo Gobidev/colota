@@ -798,15 +798,19 @@ class LocationForegroundServiceTest {
     }
 
     @Test
-    fun `only the wifi_ssid condition turns SSID tracking on`() {
+    fun `SSID tracking follows only the sync wifi_ssid condition`() {
         // Reading the SSID is attributed as location access, so it must follow the condition needing it.
         setField("config", ServiceConfig(endpoint = "https://example.com", syncCondition = "wifi_ssid"))
         invokePushConfigToSyncManager()
-        verify { networkManager.setSsidTracking(true) }
+        verify(exactly = 1) { networkManager.setSsidTracking(true) }
 
         setField("config", ServiceConfig(endpoint = "https://example.com", syncCondition = "any"))
         invokePushConfigToSyncManager()
-        verify { networkManager.setSsidTracking(false) }
+        verify(exactly = 1) { networkManager.setSsidTracking(false) }
+
+        setField("config", ServiceConfig(endpoint = "https://example.com", syncCondition = "wifi_ssid"))
+        invokePushConfigToSyncManager()
+        verify(exactly = 2) { networkManager.setSsidTracking(true) }
     }
 
     @Test

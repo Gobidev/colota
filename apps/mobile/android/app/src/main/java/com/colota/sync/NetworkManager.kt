@@ -13,6 +13,7 @@ import android.os.Looper
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -22,6 +23,7 @@ import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.security.UnrecoverableKeyException
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -40,14 +42,26 @@ class NetworkManager(private val context: Context) {
         private const val NETWORK_CHECK_CACHE_MS = 5000L
         private const val SSID_PROBE_TIMEOUT_MS = 3000L
         private const val ERROR_BODY_MAX_CHARS = 200
+        /** What Android returns instead of the SSID without location permission or with Location off. */
+        private const val UNKNOWN_SSID = "<unknown ssid>"
         private val WHITESPACE = Regex("\\s+")
     }
 
     private val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
-    @Volatile private var currentSsid: String = ""
+    @Volatile var currentSsid: String = ""
+        private set
     @Volatile private var isVpn: Boolean = false
+    @Volatile private var isWifi: Boolean = false
     @Volatile private var ssidTracking: Boolean = false
+    /** Notified on the callback thread when the transport, VPN or SSID state actually changes. */
+    @Volatile private var wifiStateListener: (() -> Unit)? = null
+    // What the listener last saw; callbacks fire for bandwidth and validation churn too.
+    private var notifiedWifi = false
+    private var notifiedVpn = false
+    private var notifiedSsid = ""
+    /** Connected Wi-Fi networks, counted so losing one of several does not clear the state. */
+    private val availableWifiNetworks = AtomicInteger(0)
     private val wifiManager = context.getSystemService(Context.WIFI_SERVICE) as? WifiManager
 
     // Lazy so existing unit tests that mock Context don't trigger EncryptedSharedPreferences init.
@@ -61,6 +75,38 @@ class NetworkManager(private val context: Context) {
     }
 
     private var networkCallback = createNetworkCallback(withSsid = false)
+
+    /**
+     * Tracks connected Wi-Fi networks by transport alone. It carries no location flag, so it can
+     * stay registered for the manager's lifetime without lighting the privacy indicator, and it
+     * sees Wi-Fi even when a VPN owns the default network.
+     */
+    private val wifiTransportCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            availableWifiNetworks.incrementAndGet()
+            refreshWifiTransport()
+        }
+
+        override fun onLost(network: Network) {
+            availableWifiNetworks.updateAndGet { maxOf(0, it - 1) }
+            refreshWifiTransport()
+        }
+    }
+
+    /**
+     * The mockable android.jar cannot build a request, so a JVM test without a Builder mock gets
+     * null and skips the registration; on device this never fails.
+     */
+    private val wifiRequest: NetworkRequest? by lazy {
+        try {
+            NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .build()
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "Wi-Fi transport request unavailable: ${e.message}")
+            null
+        }
+    }
 
     /**
      * The location-flagged callback notes FINE_LOCATION on every delivery, which lights the privacy
@@ -79,23 +125,38 @@ class NetworkManager(private val context: Context) {
             connectivityManager.registerDefaultNetworkCallback(networkCallback)
             // Committed only once a callback is live, so a failed swap can be retried.
             ssidTracking = enabled
-            if (!enabled) currentSsid = ""
+            // A cleared cache must not notify later as if the name just changed.
+            if (!enabled) {
+                currentSsid = ""
+                notifiedSsid = ""
+            }
         } catch (e: Exception) {
             AppLogger.e(TAG, "Failed to register network callback", e)
         }
     }
 
-    /** One-shot SSID read for the picker: the flagged callback is registered for this call only. */
+    /**
+     * One-shot SSID read: the flagged callback is registered for this call only. The probe asks for
+     * a Wi-Fi network rather than the default one, so it also reads the name under a VPN, where the
+     * default network is the tunnel and carries no Wi-Fi info.
+     */
     fun readSsidOnce(onResult: (String) -> Unit) {
-        if (ssidTracking) {
+        // A live value avoids a second flagged probe; a blank one still probes (VPN, or not yet read).
+        if (ssidTracking && currentSsid.isNotBlank()) {
             onResult(currentSsid)
             return
         }
 
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
             // Below S the SSID comes from WifiManager, not the callback, so waiting on one would
-            // only stall and would return "" whenever there is no default network.
+            // only stall. WifiManager reports the connected network regardless of the VPN.
             onResult(readSsid(null))
+            return
+        }
+
+        val request = wifiRequest
+        if (request == null) {
+            onResult("")
             return
         }
 
@@ -118,7 +179,7 @@ class NetworkManager(private val context: Context) {
         }
 
         try {
-            connectivityManager.registerDefaultNetworkCallback(probe)
+            connectivityManager.registerNetworkCallback(request, probe)
         } catch (e: Exception) {
             AppLogger.e(TAG, "Failed to register SSID probe", e)
             probe = null
@@ -132,10 +193,12 @@ class NetworkManager(private val context: Context) {
         fun update(caps: NetworkCapabilities) {
             if (withSsid) currentSsid = readSsid(caps)
             isVpn = caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+            notifyWifiStateIfChanged()
         }
         fun clear() {
             currentSsid = ""
             isVpn = false
+            notifyWifiStateIfChanged()
         }
 
         return if (withSsid && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -152,12 +215,32 @@ class NetworkManager(private val context: Context) {
     }
 
     private fun readSsid(caps: NetworkCapabilities?): String {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            (caps?.transportInfo as? WifiInfo)?.ssid?.removeSurrounding("\"") ?: ""
+        val raw = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            (caps?.transportInfo as? WifiInfo)?.ssid
         } else {
             @Suppress("DEPRECATION")
-            wifiManager?.connectionInfo?.ssid?.removeSurrounding("\"") ?: ""
+            wifiManager?.connectionInfo?.ssid
         }
+        val ssid = raw?.removeSurrounding("\"") ?: ""
+        // Android reports the placeholder without location permission or with Location off; treat
+        // it as no name so the condition simply does not match (and the picker cannot offer it).
+        return if (ssid == UNKNOWN_SSID) "" else ssid
+    }
+
+    private fun refreshWifiTransport() {
+        isWifi = availableWifiNetworks.get() > 0
+        notifyWifiStateIfChanged()
+    }
+
+    /** Profile evaluation is not free, so only real state changes reach the listener. */
+    @Synchronized
+    private fun notifyWifiStateIfChanged() {
+        val ssid = if (ssidTracking) currentSsid else ""
+        if (isWifi == notifiedWifi && isVpn == notifiedVpn && ssid == notifiedSsid) return
+        notifiedWifi = isWifi
+        notifiedVpn = isVpn
+        notifiedSsid = ssid
+        wifiStateListener?.invoke()
     }
 
     init {
@@ -165,6 +248,13 @@ class NetworkManager(private val context: Context) {
             connectivityManager.registerDefaultNetworkCallback(networkCallback)
         } catch (e: Exception) {
             AppLogger.e(TAG, "Failed to register network callback", e)
+        }
+        wifiRequest?.let { request ->
+            try {
+                connectivityManager.registerNetworkCallback(request, wifiTransportCallback)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Failed to register Wi-Fi transport callback", e)
+            }
         }
     }
 
@@ -534,6 +624,18 @@ class NetworkManager(private val context: Context) {
         return currentSsid.equals(ssid, ignoreCase = true)
     }
 
+    /** True while the default network is Wi-Fi. Needs no location-flagged callback. */
+    fun isWifiConnected(): Boolean = isWifi
+
+    /**
+     * Registers a callback for default-network transport / SSID changes. The listener runs on the
+     * ConnectivityManager callback thread; callers that touch app state must marshal it themselves.
+     * Used by the profile Wi-Fi conditions, which care about more than sync's one boolean.
+     */
+    fun setWifiStateListener(listener: (() -> Unit)?) {
+        wifiStateListener = listener
+    }
+
     /**
      * Returns true when the active network uses a VPN transport.
      * Updated via NetworkCallback.
@@ -541,8 +643,12 @@ class NetworkManager(private val context: Context) {
     fun isVpnConnected(): Boolean = isVpn
 
     fun destroy() {
+        wifiStateListener = null
         try {
             connectivityManager.unregisterNetworkCallback(networkCallback)
+        } catch (_: Exception) {}
+        try {
+            connectivityManager.unregisterNetworkCallback(wifiTransportCallback)
         } catch (_: Exception) {}
     }
 }

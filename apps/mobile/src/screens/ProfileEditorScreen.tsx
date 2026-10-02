@@ -4,11 +4,12 @@
  */
 
 import React, { useState, useEffect, useLayoutEffect, useCallback } from "react"
-import { View, Text, StyleSheet, ScrollView } from "react-native"
+import { View, Text, StyleSheet, ScrollView, AppState } from "react-native"
 import { useTheme } from "../hooks/useTheme"
 import { useTracking } from "../contexts/TrackingProvider"
 import { useTimeout } from "../hooks/useTimeout"
 import { ProfileService } from "../services/ProfileService"
+import NativeLocationService from "../services/NativeLocationService"
 import { showAlert, showConfirm } from "../services/modalService"
 import { TrackingProfile, ProfileConditionType } from "../types/global"
 import { fontSizes, fonts, lineHeights } from "../styles/typography"
@@ -70,16 +71,35 @@ export function ProfileEditorScreen({ navigation, route }: RootScreenProps<"Prof
     enabled: true
   })
   const [saving, setSaving] = useState(false)
+  const [currentSsid, setCurrentSsid] = useState("")
   const [text, setText] = useState({
     interval: String(settings.interval),
     distance: String(metersToInput(settings.distance)),
     speed: String(DEFAULT_SPEED_INPUT),
     priority: String(DEFAULT_PRIORITY),
+    ssid: "",
     activationDelay: String(defaultProfileDelays("charging").activationDelay),
     deactivationDelay: String(defaultProfileDelays("charging").deactivationDelay)
   })
   const [note, setNote] = useState<{ key: NumericKey; text: string } | null>(null)
   const noteTimer = useTimeout()
+
+  // Only fetched while the SSID field is open; the fallback keeps the offer button hidden.
+  useEffect(() => {
+    if (profile.condition.type !== "wifi_ssid") return
+
+    const fetchSsid = () =>
+      NativeLocationService.getCurrentSsid()
+        .then(setCurrentSsid)
+        .catch(() => setCurrentSsid(""))
+    fetchSsid()
+
+    // Connecting to a network in settings and coming back should reveal the offer.
+    const sub = AppState.addEventListener("change", (state) => {
+      if (state === "active") fetchSsid()
+    })
+    return () => sub.remove()
+  }, [profile.condition.type])
 
   useLayoutEffect(() => {
     navigation.setOptions({ headerTitle: isEditing ? t("profileEditor.titleEdit") : t("profileEditor.titleNew") })
@@ -109,6 +129,7 @@ export function ProfileEditorScreen({ navigation, route }: RootScreenProps<"Prof
             existing.condition.speedThreshold ? speedToInput(existing.condition.speedThreshold) : DEFAULT_SPEED_INPUT
           ),
           priority: String(existing.priority),
+          ssid: existing.condition.ssid ?? "",
           activationDelay: String(existing.activationDelay),
           deactivationDelay: String(existing.deactivationDelay)
         })
@@ -123,6 +144,7 @@ export function ProfileEditorScreen({ navigation, route }: RootScreenProps<"Prof
   const type = profile.condition.type
   const isSpeed = isSpeedType(type)
   const isStationary = type === "stationary"
+  const isWifiSsid = type === "wifi_ssid"
   const conditionLabel = t(conditionOf(profile).labelKey)
 
   const store = useCallback((key: NumericKey, value: number) => {
@@ -157,6 +179,13 @@ export function ProfileEditorScreen({ navigation, route }: RootScreenProps<"Prof
   const errorOf = (key: NumericKey) => wholeNumberError(text[key], minOf(key), unitOf(key))
   const noteOf = (key: NumericKey) => (note?.key === key ? note.text : undefined)
 
+  const handleSsid = (value: string) => {
+    setText((prev) => ({ ...prev, ssid: value }))
+    setProfile((prev) => ({ ...prev, condition: { ...prev.condition, ssid: value } }))
+  }
+  const ssidError = isWifiSsid && text.ssid.trim() === "" ? t("profileEditor.wifi.empty") : undefined
+  const offerCurrentSsid = currentSsid !== "" && currentSsid.trim().toLowerCase() !== text.ssid.trim().toLowerCase()
+
   const priorityError =
     text.priority !== "" && parseWholeNumber(text.priority) === null ? t("validation.wholeNumber") : undefined
   const handlePriority = (value: string) => {
@@ -181,19 +210,27 @@ export function ProfileEditorScreen({ navigation, route }: RootScreenProps<"Prof
     const speedThreshold = isSpeedType(next)
       ? (profile.condition.speedThreshold ?? inputToSpeed(parseWholeNumber(text.speed) ?? DEFAULT_SPEED_INPUT))
       : undefined
+    // Like the speed threshold, the typed network survives a switch away and re-seeds on the way
+    // back; the stored column is cleared on save because the condition object drops it.
+    const ssid = next === "wifi_ssid" ? (profile.condition.ssid ?? text.ssid) : undefined
     setProfile((prev) => ({
       ...prev,
       ...delays,
       // A distance filter is ignored for a stationary profile; store 0 so UI, DB and runtime agree.
       distance: next === "stationary" ? 0 : prev.distance,
-      condition: { type: next, ...(speedThreshold !== undefined ? { speedThreshold } : {}) }
+      condition: {
+        type: next,
+        ...(speedThreshold !== undefined ? { speedThreshold } : {}),
+        ...(ssid !== undefined ? { ssid } : {})
+      }
     }))
     setText((prev) => ({
       ...prev,
       distance: next === "stationary" ? "0" : prev.distance,
       activationDelay: String(delays.activationDelay),
       deactivationDelay: String(delays.deactivationDelay),
-      speed: speedThreshold !== undefined ? String(speedToInput(speedThreshold)) : prev.speed
+      speed: speedThreshold !== undefined ? String(speedToInput(speedThreshold)) : prev.speed,
+      ssid: ssid ?? prev.ssid
     }))
   }
 
@@ -220,11 +257,16 @@ export function ProfileEditorScreen({ navigation, route }: RootScreenProps<"Prof
     !!errorOf("interval") ||
     (!isStationary && !!errorOf("distance")) ||
     (isSpeed && !!errorOf("speed")) ||
+    !!ssidError ||
     !!errorOf("activationDelay") ||
     (!isStationary && !!errorOf("deactivationDelay"))
 
   const handleSave = useCallback(async () => {
-    const next: Draft = { ...profile, name: profile.name.trim() || conditionLabel }
+    const next: Draft = {
+      ...profile,
+      name: profile.name.trim() || conditionLabel,
+      condition: isWifiSsid ? { ...profile.condition, ssid: text.ssid.trim() } : profile.condition
+    }
     setSaving(true)
     try {
       if (isEditing && profileId) {
@@ -239,7 +281,7 @@ export function ProfileEditorScreen({ navigation, route }: RootScreenProps<"Prof
     } finally {
       setSaving(false)
     }
-  }, [profile, conditionLabel, isEditing, profileId, navigation, t])
+  }, [profile, conditionLabel, isEditing, isWifiSsid, text.ssid, profileId, navigation, t])
 
   const syncDefault = syncIntervalLabel(settings.syncInterval)
 
@@ -284,6 +326,31 @@ export function ProfileEditorScreen({ navigation, route }: RootScreenProps<"Prof
                       error={errorOf("speed")}
                       message={noteOf("speed")}
                     />
+                  </View>
+                )}
+                {opt.type === "wifi_ssid" && type === opt.type && (
+                  <View style={styles.reveal}>
+                    <TextField
+                      label={t("profileEditor.wifi.ssid")}
+                      testID="wifi-ssid-input"
+                      mono
+                      value={text.ssid}
+                      onChangeText={handleSsid}
+                      placeholder={t("trackingSync.ssid.placeholder")}
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                      error={ssidError}
+                    />
+                    <FieldMessage>{t("profileEditor.wifi.hint")}</FieldMessage>
+                    {offerCurrentSsid && (
+                      <Button
+                        variant="secondary"
+                        title={t("trackingSync.ssid.use", { ssid: currentSsid })}
+                        testID="wifi-ssid-use"
+                        onPress={() => handleSsid(currentSsid)}
+                        style={styles.ssidUse}
+                      />
+                    )}
                   </View>
                 )}
               </React.Fragment>
@@ -443,6 +510,7 @@ const styles = StyleSheet.create({
   cardTop: { paddingTop: space.lg },
   // The row above already pays space.lg below it; the field's own bottom margin is the card's tail.
   reveal: { paddingLeft: size.iconColumn, marginTop: -space.xs },
+  ssidUse: { marginTop: space.sm, alignSelf: "flex-start" },
   field: { paddingBottom: space.lg },
   numInput: { width: size.numericField },
   figure: { fontSize: fontSizes.input, ...fonts.medium, fontVariant: ["tabular-nums"] },
